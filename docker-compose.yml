@@ -1,0 +1,59 @@
+version: "3.9"
+services:
+
+  db:
+    image: timescale/timescaledb:latest-pg16
+    environment:
+      POSTGRES_USER: ${DB_USER}
+      POSTGRES_PASSWORD: ${DB_PASS}
+      POSTGRES_DB: monitor
+    volumes:
+      - db_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${DB_USER} -d monitor"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+  redis:
+    image: redis:7-alpine
+    command: redis-server --maxmemory 128mb --maxmemory-policy allkeys-lru
+
+  backend:
+    build: ./backend
+    env_file: .env
+    environment:
+      - ENVIRONMENT=development
+    depends_on:
+      db:
+        condition: service_healthy
+    ports: ["8000:8000"]
+    volumes:
+      - ./backend/app:/app/app
+
+  frontend:
+    image: node:20-alpine
+    working_dir: /frontend
+    command: sh -c "npm install && npm run dev -- --host"
+    ports: ["5173:5173"]
+    volumes:
+      - ./frontend:/frontend
+      - /frontend/node_modules
+    environment:
+      - VITE_API_URL=http://localhost:8000/api/v1
+    restart: unless-stopped
+
+  mock-agent:
+    build:
+      context: .
+      dockerfile: tools/Dockerfile.mock
+    environment:
+      - API_URL=http://backend:8000/api/v1/metrics
+      - INTERVAL=10
+    depends_on:
+      backend:
+        condition: service_started
+    restart: unless-stopped
+
+volumes:
+  db_data:
