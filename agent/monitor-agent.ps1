@@ -1,100 +1,128 @@
-<#
-.SYNOPSIS
-    Agente de monitoreo — lee configuración con contraseña cifrada (DPAPI).
-#>
-
 $ConfigPath = "C:\MonitorAgent\config.json"
-if (-not (Test-Path $ConfigPath)) { Write-Error "Falta $ConfigPath"; exit 1 }
-
-$Config   = Get-Content $ConfigPath | ConvertFrom-Json
-$ApiUrl   = $Config.api_url
-$Email    = $Config.email
-$Interval = if ($Config.interval_seconds) { $Config.interval_seconds } else { 30 }
-
-# ── Descifrar contraseña (DPAPI, misma clave que el instalador) ───────────────
-function Get-MachineKey {
-    $sid   = (Get-WmiObject Win32_UserAccount -Filter "Name='Administrator'").SID
-    if (-not $sid) { $sid = "$env:COMPUTERNAME-monitor-2024-static" }
-    $bytes = [System.Text.Encoding]::UTF8.GetBytes($sid.PadRight(32).Substring(0,32))
-    return [byte[]]$bytes
+if (-not (Test-Path $ConfigPath)) {
+    Write-Host "ERROR: No se encontro config.json" -ForegroundColor Red
+    exit 1
 }
 
-$key      = Get-MachineKey
-$Password = [Runtime.InteropServices.Marshal]::PtrToStringAuto(
-                [Runtime.InteropServices.Marshal]::SecureStringToBSTR(
-                    (ConvertTo-SecureString $Config.encrypted_pass -Key $key)))
+$Config     = Get-Content $ConfigPath | ConvertFrom-Json
+$ApiUrl     = $Config.api_url
+$Email      = $Config.email
+$Password   = $Config.password
+$Interval   = if ($Config.interval_seconds) { $Config.interval_seconds } else { 30 }
+$LoginUrl   = $ApiUrl -replace "/metrics$", "/auth/login"
+$MachineId  = $env:COMPUTERNAME
 
-$LoginUrl  = $ApiUrl -replace "/metrics$", "/auth/login"
-$MachineId = $env:COMPUTERNAME
-
-function Write-Log($Level, $Msg) {
-    $line = "[$(Get-Date -f 'yyyy-MM-dd HH:mm:ss')][$Level] $Msg"
-    Write-Output $line
-    Add-Content "C:\MonitorAgent\agent.log" $line -ErrorAction SilentlyContinue
+function Write-Log {
+    param([string]$Level, [string]$Msg)
+    $Line = "[$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')][$Level] $Msg"
+    Write-Output $Line
+    Add-Content -Path "C:\MonitorAgent\agent.log" -Value $Line -ErrorAction SilentlyContinue
 }
 
-function Get-AuthToken {
+function Get-Token {
     try {
-        $r = Invoke-RestMethod -Uri $LoginUrl -Method Post -ContentType "application/json" `
-                -Body (@{email=$Email; password=$Password} | ConvertTo-Json) -ErrorAction Stop
-        Write-Log "OK" "Autenticado | tenant: $($r.user.tenant_id.Substring(0,8))..."
-        return @{ token=$r.token.access_token; tenant_id=$r.user.tenant_id; expires=(Get-Date).AddMinutes(55) }
+        $Body = "{`"email`":`"$Email`",`"password`":`"$Password`"}"
+        $R = Invoke-RestMethod -Uri $LoginUrl -Method Post -Body $Body -ContentType "application/json" -ErrorAction Stop
+        Write-Log "OK" "Autenticado | tenant: $($R.user.tenant_id.Substring(0,8))..."
+        return @{
+            token     = $R.token.access_token
+            tenant_id = $R.user.tenant_id
+            expires   = (Get-Date).AddMinutes(55)
+        }
     } catch {
-        Write-Log "ERR" "Login fallido: $_"
+        Write-Log "ERR" "Login fallido: $($_.Exception.Message)"
         return $null
     }
 }
 
-function Get-Metrics($TenantId) {
-    $cpu     = (Get-CimInstance Win32_Processor | Measure-Object -Property LoadPercentage -Average).Average
-    $os      = Get-CimInstance Win32_OperatingSystem
-    $ramPct  = [math]::Round((($os.TotalVisibleMemorySize - $os.FreePhysicalMemory) / $os.TotalVisibleMemorySize) * 100, 2)
-    $disk    = Get-CimInstance Win32_LogicalDisk -Filter "DriveType=3" | ForEach-Object {
-                   @{ device=$_.DeviceID; used_pct=[math]::Round(($_.Size-$_.FreeSpace)/$_.Size*100,2) } }
-    $uptime  = [math]::Round(((Get-Date) - $os.LastBootUpTime).TotalHours, 2)
-    $ip      = (Get-NetIPAddress -AddressFamily IPv4 |
-                Where-Object { $_.InterfaceAlias -notmatch "Loopback|vEthernet" -and
-                               $_.PrefixOrigin -match "Dhcp|Manual" } | Select-Object -First 1).IPAddress
-    $secEvts = @()
-    try {
-        $secEvts = Get-WinEvent -FilterHashtable @{LogName="Security";StartTime=(Get-Date).AddMinutes(-5);Id=4625,4648,4720,4726} `
-                   -ErrorAction SilentlyContinue |
-                   Select-Object @{n="id";e={$_.Id}}, @{n="time";e={$_.TimeCreated.ToString("o")}},
-                                 @{n="message";e={$_.Message.Split("`n")[0].Trim()}}
-    } catch {}
+function Send-Metrics {
+    param([string]$TenantId, [hashtable]$Headers)
 
-    return @{
-        tenant_id=$TenantId; machine_id=$MachineId; cpu_pct=[math]::Round($cpu,2)
-        ram_pct=$ramPct; disk=$disk; uptime_hours=$uptime
-        security_events=($secEvts | ConvertTo-Json -Compress); ip=$ip
-        timestamp=(Get-Date).ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ssZ")
+    # CPU
+    $Cpu = [math]::Round(
+        (Get-CimInstance Win32_Processor | Measure-Object -Property LoadPercentage -Average).Average, 2)
+
+    # RAM
+    $Os     = Get-CimInstance Win32_OperatingSystem
+    $RamPct = [math]::Round((($Os.TotalVisibleMemorySize - $Os.FreePhysicalMemory) / $Os.TotalVisibleMemorySize) * 100, 2)
+
+    # Disco — forzar array aunque haya un solo disco
+    $DiskArr = @(Get-CimInstance Win32_LogicalDisk -Filter "DriveType=3" | ForEach-Object {
+        $UsedPct = if ($_.Size -gt 0) { [math]::Round(($_.Size - $_.FreeSpace) / $_.Size * 100, 2) } else { 0 }
+        [PSCustomObject]@{ device = $_.DeviceID; used_pct = $UsedPct }
+    })
+
+    # Uptime
+    $Uptime = [math]::Round(((Get-Date) - $Os.LastBootUpTime).TotalHours, 2)
+
+    # IP — manejar null
+    $IpObj = Get-NetIPAddress -AddressFamily IPv4 -ErrorAction SilentlyContinue |
+             Where-Object { $_.InterfaceAlias -notmatch "Loopback|vEthernet" -and $_.PrefixOrigin -match "Dhcp|Manual" } |
+             Select-Object -First 1
+    $Ip = if ($IpObj) { $IpObj.IPAddress } else { "0.0.0.0" }
+
+    # Construir payload como PSCustomObject para serializar correctamente
+    $Payload = [PSCustomObject]@{
+        tenant_id       = $TenantId
+        machine_id      = $MachineId
+        cpu_pct         = $Cpu
+        ram_pct         = $RamPct
+        disk            = $DiskArr
+        uptime_hours    = $Uptime
+        security_events = "[]"
+        ip              = $Ip
+        timestamp       = (Get-Date).ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ssZ")
+    }
+
+    $Body = $Payload | ConvertTo-Json -Depth 5 -Compress
+
+    try {
+        $Resp = Invoke-RestMethod -Uri $ApiUrl -Method Post -Headers $Headers -Body $Body -ContentType "application/json" -ErrorAction Stop
+        Write-Log "OK" "CPU ${Cpu}%  RAM ${RamPct}%  IP $Ip"
+        return $true
+    } catch {
+        $Code = $_.Exception.Response.StatusCode.value__
+        Write-Log "ERR" "HTTP $Code - $($_.Exception.Message)"
+        if ($Code -eq 401) { return $false }
+        return $true
     }
 }
 
 Write-Log "OK" "Agente iniciado | $MachineId | intervalo: ${Interval}s"
-$auth = Get-AuthToken
-if (-not $auth) { Write-Log "ERR" "No se pudo autenticar — abortando"; exit 1 }
+Start-Sleep -Seconds 2
 
-$errors = 0
+$Auth = Get-Token
+if (-not $Auth) {
+    Write-Log "ERR" "No se pudo autenticar - abortando"
+    exit 1
+}
+
+$Errors = 0
 while ($true) {
-    if ((Get-Date) -gt $auth.expires) {
-        $auth = Get-AuthToken
-        if (-not $auth) { Start-Sleep 60; continue }
+    if ((Get-Date) -gt $Auth.expires) {
+        Write-Log "OK" "Renovando token..."
+        $Auth = Get-Token
+        if (-not $Auth) { Start-Sleep -Seconds 60; continue }
     }
-    $headers = @{ "Authorization"="Bearer $($auth.token)"; "Content-Type"="application/json" }
-    try {
-        $m    = Get-Metrics -TenantId $auth.tenant_id
-        $resp = Invoke-RestMethod -Uri $ApiUrl -Method Post -Headers $headers `
-                    -Body ($m | ConvertTo-Json -Depth 4) -ErrorAction Stop
-        $status = if (($resp | Measure-Object).Count -gt 0) { "⚠️ ALERTA" } else { "OK" }
-        Write-Log $status "CPU $($m.cpu_pct)%  RAM $($m.ram_pct)%  | $status"
-        $errors = 0
-    } catch {
-        $errors++
-        $code = $_.Exception.Response.StatusCode.value__
-        Write-Log "ERR" "HTTP $code — $_"
-        if ($code -eq 401) { $auth.expires = (Get-Date).AddSeconds(-1) }
-        if ($errors -ge 10) { Start-Sleep 300; $errors = 0 }
+
+    $Headers = @{
+        "Authorization" = "Bearer $($Auth.token)"
+        "Content-Type"  = "application/json"
     }
-    Start-Sleep $Interval
+
+    $Ok = Send-Metrics -TenantId $Auth.tenant_id -Headers $Headers
+    if (-not $Ok) {
+        $Auth.expires = (Get-Date).AddSeconds(-1)
+        $Errors++
+    } else {
+        $Errors = 0
+    }
+
+    if ($Errors -ge 10) {
+        Write-Log "ERR" "Demasiados errores - esperando 5 min"
+        Start-Sleep -Seconds 300
+        $Errors = 0
+    }
+
+    Start-Sleep -Seconds $Interval
 }
